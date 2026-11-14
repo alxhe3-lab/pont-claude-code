@@ -1,23 +1,10 @@
 # Pont Claude Code
 
-**Relie une conversation Claude (app de bureau) à Claude Code sur ton ordinateur. Plus de copier-coller entre les deux.**
+Je construis une app perso avec Claude Code, et je prépare souvent mes consignes dans le chat Claude. Le problème, c'est que je passais mon temps à faire le facteur : copier le prompt du chat, le coller dans Claude Code, recopier sa réponse dans le chat, recommencer.
+
+Alors j'ai fait cette extension pour Claude Desktop. Le chat lance Claude Code lui-même sur mon ordinateur, suit ce qu'il fait, répond à ses questions quand il connaît déjà la réponse, et ne me dérange qu'à la fin.
 
 *[English below](#english)*
-
-Sans le pont, tu fais la navette à la main : tu demandes un prompt au chat, tu le colles dans Claude Code, tu recopies son rendu dans le chat, et ainsi de suite.
-
-Avec le pont, tout se fait depuis le chat :
-
-1. Le chat rédige un brief complet et lance Claude Code dans le dossier du projet.
-2. Il suit l'avancement (fichiers lus, commandes lancées…).
-3. Si Claude Code pose une question, **le chat y répond lui-même** quand la réponse est déjà dans la conversation.
-4. Tu n'es interrompu **qu'à la fin**, ou si une info ou une décision ne peut venir que de toi.
-
-```
-toi ──► chat Claude ──cc_start──► Claude Code (ton Mac/PC, ton projet)
-              ▲  ◄──cc_wait── progression, rapport, questions
-              └──cc_reply──► réponses, étape suivante (même session)
-```
 
 En schéma :
 
@@ -44,7 +31,7 @@ flowchart LR
 2. Double-clique dessus (ou glisse-le dans **Réglages → Extensions** de Claude Desktop), puis clique sur Installer.
 3. Choisis éventuellement un dossier de projet par défaut et un mode de permissions.
 
-C'est tout. Dans une conversation, dis par exemple :
+Ensuite, il suffit de le demander dans une conversation, par exemple :
 
 > « Dans ~/mon-projet, ajoute une page de connexion avec Claude Code et dis-moi quand c'est fini. »
 
