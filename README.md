@@ -19,6 +19,20 @@ toi ──► chat Claude ──cc_start──► Claude Code (ton Mac/PC, ton p
               └──cc_reply──► réponses, étape suivante (même session)
 ```
 
+En schéma :
+
+```mermaid
+flowchart LR
+    U(["Toi"]) -->|"une demande"| C["Chat Claude<br/>(app de bureau)"]
+    C -->|"cc_start : consigne complète"| P{{"Pont Claude Code"}}
+    P -->|"lance claude -p"| CC["Claude Code<br/>dans ton projet"]
+    CC -->|"progression, rapport"| P
+    P -->|"cc_wait"| C
+    CC -.->|"question bloquante"| P
+    C -.->|"cc_reply : réponse ou étape suivante"| P
+    C -->|"le résultat, à la fin"| U
+```
+
 ## Prérequis
 
 - L'app **Claude Desktop** (macOS ou Windows).
