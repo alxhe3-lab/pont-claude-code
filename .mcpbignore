@@ -1,0 +1,7 @@
+test/
+server/
+node_modules/
+*.mcpb
+.git/
+.gitignore
+package-lock.json

@@ -1,0 +1,119 @@
+{
+  "manifest_version": "0.3",
+  "name": "pont-claude-code",
+  "display_name": "Pont Claude Code",
+  "version": "0.3.0",
+  "description": "Let your Claude chat hand work to Claude Code on your computer, follow it, answer its questions and get the result back. No more copy-paste.",
+  "long_description": "Pont Claude Code connects a conversation in the Claude desktop app to Claude Code on the same computer.\n\nThe chat writes the brief, starts Claude Code in the project folder, follows its progress, answers Claude Code's questions itself whenever the answer is already in the conversation, and only interrupts you at the end, or when it needs information that only you have.\n\nRequires Claude Code to be installed and signed in on this computer (`claude` command).",
+  "author": {
+    "name": "alxhe3-lab",
+    "url": "https://github.com/alxhe3-lab"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "bridge",
+    "delegate",
+    "coding",
+    "agent"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/dist/index.mjs"
+      ],
+      "env": {
+        "PONT_DEFAULT_CWD": "${user_config.default_cwd}",
+        "PONT_PERMISSION_MODE": "${user_config.permission_mode}",
+        "PONT_ALLOWED_TOOLS": "${user_config.allowed_tools}",
+        "PONT_MODEL": "${user_config.model}",
+        "CLAUDE_BIN": "${user_config.claude_bin}",
+        "PONT_ALLOW_BYPASS": "${user_config.allow_bypass}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "cc_start",
+      "description": "Start Claude Code in a project folder with a full brief."
+    },
+    {
+      "name": "cc_wait",
+      "description": "Follow a task: progress, then the report, questions or blocked actions. until_done waits for the end (up to 2 h)."
+    },
+    {
+      "name": "cc_reply",
+      "description": "Answer Claude Code or give the next step, in the same session (until_done to wait for the end)."
+    },
+    {
+      "name": "cc_stop",
+      "description": "Interrupt a task and what it launched (the session is kept)."
+    },
+    {
+      "name": "cc_list",
+      "description": "Recent tasks (kept across restarts) and the bridge's setup."
+    }
+  ],
+  "user_config": {
+    "default_cwd": {
+      "type": "directory",
+      "title": "Default project folder",
+      "description": "Folder where Claude Code works when the chat doesn't name one.",
+      "required": false,
+      "default": "${HOME}"
+    },
+    "permission_mode": {
+      "type": "string",
+      "title": "Permission mode",
+      "description": "What Claude Code may do on its own: acceptEdits (edit files; other actions are blocked and the chat asks you), auto (Claude Code judges what is safe), manual (nothing without approval), dontAsk (only the extra allowed tools), plan (read and plan only).",
+      "required": false,
+      "default": "acceptEdits"
+    },
+    "allowed_tools": {
+      "type": "string",
+      "title": "Extra allowed tools",
+      "description": "Optional, comma-separated, e.g. Bash(npm:*),Bash(git:*),Bash(node:*) to let Claude Code run those commands without approval.",
+      "required": false,
+      "default": ""
+    },
+    "allow_bypass": {
+      "type": "boolean",
+      "title": "Allow bypassPermissions",
+      "description": "Let the chat run Claude Code with no permission checks at all. Off by default: leave it off unless you work in a folder where nothing can go wrong.",
+      "required": false,
+      "default": false
+    },
+    "model": {
+      "type": "string",
+      "title": "Model (optional)",
+      "description": "Model for Claude Code, e.g. opus or sonnet. Empty = your Claude Code default.",
+      "required": false,
+      "default": ""
+    },
+    "claude_bin": {
+      "type": "string",
+      "title": "Path to claude (optional)",
+      "description": "Only if the extension can't find Claude Code, e.g. /Users/you/.local/bin/claude.",
+      "required": false,
+      "default": ""
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "linux",
+      "win32"
+    ],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alxhe3-lab/pont-claude-code"
+  }
+}
