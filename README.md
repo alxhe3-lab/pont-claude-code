@@ -1,10 +1,23 @@
 # Pont Claude Code
 
-Je construis une app perso avec Claude Code, et je prépare souvent mes consignes dans le chat Claude. Le problème, c'est que je passais mon temps à faire le facteur : copier le prompt du chat, le coller dans Claude Code, recopier sa réponse dans le chat, recommencer.
-
-Alors j'ai fait cette extension pour Claude Desktop. Le chat lance Claude Code lui-même sur mon ordinateur, suit ce qu'il fait, répond à ses questions quand il connaît déjà la réponse, et ne me dérange qu'à la fin.
+**Relie une conversation Claude (app de bureau) à Claude Code sur ton ordinateur. Plus de copier-coller entre les deux.**
 
 *[English below](#english)*
+
+Sans le pont, tu fais la navette à la main : tu demandes un prompt au chat, tu le colles dans Claude Code, tu recopies son rendu dans le chat, et ainsi de suite.
+
+Avec le pont, tout se fait depuis le chat :
+
+1. Le chat rédige un brief complet et lance Claude Code dans le dossier du projet.
+2. Il suit l'avancement (fichiers lus, commandes lancées…).
+3. Si Claude Code pose une question, **le chat y répond lui-même** quand la réponse est déjà dans la conversation.
+4. Tu n'es interrompu **qu'à la fin**, ou si une info ou une décision ne peut venir que de toi.
+
+```
+toi ──► chat Claude ──cc_start──► Claude Code (ton Mac/PC, ton projet)
+              ▲  ◄──cc_wait── progression, rapport, questions
+              └──cc_reply──► réponses, étape suivante (même session)
+```
 
 En schéma :
 
@@ -31,7 +44,7 @@ flowchart LR
 2. Double-clique dessus (ou glisse-le dans **Réglages → Extensions** de Claude Desktop), puis clique sur Installer.
 3. Choisis éventuellement un dossier de projet par défaut et un mode de permissions.
 
-Ensuite, il suffit de le demander dans une conversation, par exemple :
+C'est tout. Dans une conversation, dis par exemple :
 
 > « Dans ~/mon-projet, ajoute une page de connexion avec Claude Code et dis-moi quand c'est fini. »
 
@@ -57,18 +70,39 @@ Quand une action est bloquée, la tâche passe en `needs_permission`. Le reste d
 | Outil | Rôle |
 |---|---|
 | `cc_start` | lance une tâche (brief, dossier, mode ; `session_id` pour reprendre une session existante, même lancée dans le terminal) |
-| `cc_wait` | attend jusqu'à 50 s et renvoie la progression, puis le rapport, les questions ou les actions bloquées. Avec `until_done: true`, attend la fin de l'exécution (jusqu'à `max_minutes`, 60 par défaut, 120 au plus) |
-| `cc_reply` | répond ou donne l'étape suivante dans **la même session** Claude Code ; accepte aussi `until_done` et `max_minutes` |
-| `cc_stop` | interrompt la tâche et ce qu'elle a lancé (serveur de dev…) ; la session est gardée |
-| `cc_list` | tâches récentes (gardées après un redémarrage) et réglages détectés |
+| `cc_wait` | attend jusqu'à 50 s et renvoie la progression, puis le rapport, les questions ou les actions bloquées. Avec `until_done: true`, attend la fin de l'exécution, mais rend la main d'elle-même au bout de 70 s (limite de sécurité `safety_seconds`) avec le statut `running` |
+| `cc_reply` | répond ou donne l'étape suivante dans **la même session** Claude Code ; accepte aussi `until_done`, `max_minutes` et `safety_seconds` |
+| `cc_stop` | interrompt la tâche et ce qu'elle a lancé (serveur de dev…), ou annule sa reprise automatique ; la session est gardée |
+| `cc_list` | tâches récentes (gardées après un redémarrage, avec `resume_at` pour celles qui attendent leur limite) et réglages détectés ; avertit si le mode par défaut est `bypassPermissions` (« mode par défaut dangereux, préférez acceptEdits ») |
 
-Statuts : `running`, `needs_input`, `needs_permission`, `done`, `error`, `stopped`, `interrupted`.
+Statuts : `running`, `needs_input`, `needs_permission`, `done`, `error`, `stopped`, `interrupted`, `waiting_limit` (limite d'usage atteinte, reprise automatique prévue).
+
+### Reprise automatique après une limite d'usage
+
+Quand Claude Code s'arrête sur une limite d'usage (« You've hit your 5-hour limit · resets 3:10am (Europe/Bucharest) », ou une ligne de progression « usage limit: rejected »), la tâche ne s'arrête plus en `error` :
+
+- elle passe en `waiting_limit`, avec `resume_at` (l'heure de réinitialisation lue dans le message, avec son fuseau : aujourd'hui, ou demain si l'heure est passée). Si l'heure ne peut pas être lue, le pont réessaie toutes les 30 minutes. Ce statut se voit dans `cc_list`, `cc_wait` et le journal ;
+- à `resume_at` + 2 minutes, le pont relance **la même session**, comme un `cc_reply`, avec **le même mode de permission** que le dernier run (jamais un mode plus large ; si ce mode n'est plus autorisé par les réglages, la tâche passe en `error` au lieu de reprendre) et le message réglable *Automatic resume message* ;
+- si plusieurs tâches attendent, les reprises sont espacées de 20 s ;
+- au plus 6 reprises automatiques par tâche. Chaque reprise est notée dans l'historique de la tâche (`auto_resume_history` : « reprise automatique n°1 à 03:12 ») ;
+- les tâches en attente sont enregistrées dans `tasks.json`. Au démarrage de l'extension, elles sont réarmées, et celles dont l'heure est passée reprennent tout de suite ;
+- le pont vérifie toutes les 60 s les reprises dues, en comparant avec l'heure réelle : une reprise prévue pendant une veille a lieu dans la minute qui suit le réveil ;
+- `cc_stop` annule une reprise prévue ; `cc_reply` relance tout de suite (la limite peut encore bloquer).
+
+Réglage : **Reprendre automatiquement après la limite d'usage** (activé par défaut). Désactivé, une limite termine la tâche en `error`, comme avant.
+
+### Garder le Mac éveillé
+
+Tant qu'au moins une tâche tourne ou attend sa limite (`waiting_limit`), le pont lance `caffeinate -i` (macOS), rattaché à l'extension (`-w` : il s'arrête tout seul si l'extension se ferme), et l'arrête quand plus rien ne tourne. Réglage : **Keep the Mac awake while working** (activé par défaut).
+
+**Attention : capot fermé sur batterie, macOS met quand même le Mac en veille**, `caffeinate` n'y peut rien. Pour que le travail continue la nuit, laisse le Mac **ouvert, ou branché sur secteur**. Si le Mac dort malgré tout, la reprise se fait au réveil.
 
 ### Attendre jusqu'à la fin (`until_done`)
 
 Pour une tâche de plus d'une minute, le chat appelle `cc_wait` avec `until_done: true`. L'appel reste ouvert jusqu'à ce que la tâche quitte l'état `running` (`done`, `needs_input`, `needs_permission`, `error`, `stopped`, `interrupted`), puis renvoie le résultat habituel. L'app Claude met ces appels longs en arrière-plan et reprend la conversation quand ils se terminent : le chat n'a plus à vérifier toutes les 50 secondes.
 
-- `max_minutes` (60 par défaut, 120 au plus) limite l'attente. Une fois cette durée atteinte, l'outil renvoie `running` avec une note. La tâche continue et un nouveau `cc_wait` reprend l'attente.
+- **Limite de sécurité (70 s par défaut)** : depuis une session distante, le client coupe les appels vers 80 s. L'appel `until_done` rend donc la main tout seul au bout de 70 s avec le statut `running` et une note ; la tâche continue et le chat rappelle `cc_wait` avec `until_done: true`. Réglable dans les réglages de l'extension (*until_done safety limit*) ou appel par appel avec `safety_seconds` ; `0` désactive la limite (attente jusqu'à `max_minutes`).
+- `max_minutes` (60 par défaut, 120 au plus) limite l'attente quand la limite de sécurité est désactivée ou plus longue. Une fois cette durée atteinte, l'outil renvoie `running` avec une note. La tâche continue et un nouveau `cc_wait` reprend l'attente.
 - Si le client abandonne l'appel avant la fin (délai dépassé, annulation), la tâche Claude Code **n'est pas interrompue** : elle continue, et le `cc_wait` suivant la retrouve avec toute sa progression.
 - Pendant l'attente, le pont envoie une notification de progression toutes les 10 s si le client en demande. Les clients qui remettent leur délai à zéro à chaque notification gardent ainsi l'appel ouvert.
 - Sans `until_done`, rien ne change : 50 s au plus.
@@ -80,16 +114,18 @@ Pour une tâche de plus d'une minute, le chat appelle `cc_wait` avec `until_done
 - La session reçoit un identifiant fixe (`--session-id`) et chaque réponse la reprend (`--resume`) : Claude Code garde tout le contexte.
 - Une consigne ajoutée à Claude Code (`--append-system-prompt-file`) lui dit de travailler seul, de ne pas contourner un refus de permission et, s'il est vraiment bloqué, d'écrire ses questions sur des lignes `BRIDGE_QUESTION:`.
 - Le chat ne reçoit qu'un résumé compact : les étapes (fichiers, commandes), puis le rapport final. Les messages des sous-agents et les doublons sont filtrés.
-- Les tâches sont enregistrées dans `~/.pont-claude-code/tasks.json`. Si tu fermes l'app pendant une tâche, elle passe en `interrupted` et `cc_reply` la reprend.
-- Les modes de permission sont lus dans `claude --help`, ce qui suit les versions de Claude Code.
+- Les tâches sont enregistrées dans `~/.pont-claude-code/tasks.json`, qui garde les 50 tâches les plus récentes (une tâche relancée redevient récente). Les plus anciennes sont déplacées telles quelles à la fin de `~/.pont-claude-code/tasks-archive.json`. Avant sa première écriture, la 0.3.1 copie l'ancien fichier dans `tasks.before-0.3.1.json`, et la 0.4.0 dans `tasks.before-0.4.0.json`. Les tâches en `waiting_limit` y restent toujours. Si tu fermes l'app pendant une tâche, elle passe en `interrupted` et `cc_reply` la reprend.
+- Les modes de permission sont lus dans `claude --help`, ce qui suit les versions de Claude Code. Si le réglage *Permission mode* n'est pas exactement un mode mais contient le nom d'un seul mode (par exemple « Allow bypassPermissions »), ce mode est utilisé (bypassPermissions reste soumis à *Allow bypassPermissions*). S'il en contient plusieurs ou aucun, c'est `acceptEdits`. Dans les deux cas, un avertissement est écrit dans le journal et dans `cc_list`.
 
 ## Développement
 
 ```bash
 npm install
-npm test          # 15 scénarios avec un faux Claude Code (questions, permissions, arrêt, redémarrage, until_done…)
+npm run typecheck # vérification des types (TypeScript sur le JavaScript, sans compilation)
+npm test          # tests unitaires (server/lib.js, server/autoresume.js sur une horloge simulée) + 24 scénarios avec un faux Claude Code et un faux caffeinate (questions, permissions, arrêt, redémarrage, until_done, archive, limite d'usage et reprise automatique…), sur le source puis sur le paquet construit
+                  # PONT_TASKS_COPY=/chemin/vers/une/copie/de/tasks.json npm test : rejoue aussi le réarmement sur cette copie
 npm run test:real # vérification avec ton vrai Claude Code dans un dossier jetable (consomme un peu de quota)
-npm run pack      # fabrique pont-claude-code.mcpb
+npm run pack      # fabrique pont-claude-code-<version>.mcpb
 ```
 
 Pour l'utiliser sans .mcpb, ajoute ceci à `claude_desktop_config.json` :
@@ -101,13 +137,14 @@ Pour l'utiliser sans .mcpb, ajoute ceci à `claude_desktop_config.json` :
 } } }
 ```
 
-Variables : `PONT_DEFAULT_CWD`, `PONT_PERMISSION_MODE`, `PONT_ALLOWED_TOOLS`, `PONT_ALLOW_BYPASS`, `PONT_MODEL`, `CLAUDE_BIN`, `PONT_STATE_DIR`.
+Variables : `PONT_DEFAULT_CWD`, `PONT_PERMISSION_MODE`, `PONT_ALLOWED_TOOLS`, `PONT_ALLOW_BYPASS`, `PONT_MODEL`, `CLAUDE_BIN`, `PONT_STATE_DIR`, `PONT_UNTIL_DONE_SAFETY_S`, `PONT_AUTO_RESUME`, `PONT_AUTO_RESUME_MESSAGE`, `PONT_KEEP_AWAKE`.
 
 ## Limites connues
 
-- Avec `until_done`, un seul appel suffit jusqu'à 2 h. Au-delà, ou si le client n'accepte pas les appels longs (erreur de délai dépassé), le chat refait des appels `cc_wait` ; la tâche n'est jamais interrompue par ces coupures. Sans `until_done`, chaque appel dure au plus 50 s.
+- Avec `until_done`, chaque appel dure au plus 70 s par défaut (limite de sécurité) ; avec la limite à 0, un seul appel suffit jusqu'à 2 h. Au-delà, ou si le client n'accepte pas les appels longs (erreur de délai dépassé), le chat refait des appels `cc_wait` ; la tâche n'est jamais interrompue par ces coupures. Sans `until_done`, chaque appel dure au plus 50 s.
 - Si le client coupe un appel long sans prévenir le pont, quelques lignes de progression peuvent ne pas être renvoyées. Le statut, le rapport, les questions et les actions bloquées reviennent toujours au `cc_wait` suivant.
-- Fermer l'app Claude pendant une tâche l'arrête quand même : elle passe en `interrupted` et `cc_reply` la reprend.
+- Fermer l'app Claude pendant une tâche l'arrête quand même : elle passe en `interrupted` et `cc_reply` la reprend. Une tâche en `waiting_limit`, elle, reprend toute seule à la réouverture si son heure est passée.
+- La reprise automatique n'a lieu que si l'app Claude (donc l'extension) est ouverte à ce moment-là, et que le Mac ne dort pas (voir « Garder le Mac éveillé »).
 - Pour reprendre une session lancée dans le terminal, donne son `session_id` **et le même dossier** : Claude Code range ses sessions par dossier.
 - Ne marche qu'avec l'app **de bureau**, parce que Claude Code doit tourner sur ta machine. claude.ai dans le navigateur et le mobile ne voient pas l'extension.
 - Testé sur macOS avec Claude Code 2.1.323. Windows est prévu dans le code mais pas encore vérifié sur une vraie machine.
@@ -122,7 +159,9 @@ Variables : `PONT_DEFAULT_CWD`, `PONT_PERMISSION_MODE`, `PONT_ALLOWED_TOOLS`, `P
 **Requirements:** Claude Desktop + Claude Code installed and signed in (`claude` works in a terminal).
 **Install:** open `pont-claude-code.mcpb` (or drag it into Settings → Extensions).
 **Tools:** `cc_start`, `cc_wait`, `cc_reply`, `cc_stop`, `cc_list`. See the tables above.
-**Waiting until the end:** `cc_wait` (and `cc_reply`) accept `until_done: true`. The call stays open until the task leaves `running` (done, needs_input, needs_permission, error, stopped, interrupted) or `max_minutes` is reached (default 60, max 120), then returns the usual result. The Claude app runs long tool calls in the background and wakes the conversation when they finish, so the chat no longer polls every 50 s. Without `until_done`, `cc_wait` still returns within 50 s. If the client drops the call early (timeout, cancel), the Claude Code task is never interrupted: it keeps running and the next `cc_wait` picks it up with all its progress. Progress notifications are sent every 10 s when the client asks for them. `cc_start` doesn't take `until_done`: if a long `cc_start` were cut, the chat wouldn't have the `task_id` and might start the task twice.
+**Waiting until the end:** `cc_wait` (and `cc_reply`) accept `until_done: true`. The call stays open until the task leaves `running` (done, needs_input, needs_permission, error, stopped, interrupted) or `max_minutes` is reached (default 60, max 120), then returns the usual result. A safety limit (70 s by default, `safety_seconds` or the *until_done safety limit* setting, 0 = off) makes it come back by itself with status `running` before a remote session cuts the call (about 80 s). The Claude app runs long tool calls in the background and wakes the conversation when they finish, so the chat no longer polls every 50 s. Without `until_done`, `cc_wait` still returns within 50 s. If the client drops the call early (timeout, cancel), the Claude Code task is never interrupted: it keeps running and the next `cc_wait` picks it up with all its progress. Progress notifications are sent every 10 s when the client asks for them. `cc_start` doesn't take `until_done`: if a long `cc_start` were cut, the chat wouldn't have the `task_id` and might start the task twice.
+**Usage limits (0.4.0):** when Claude Code stops on a usage limit ("You've hit your 5-hour limit · resets 3:10am (Europe/Bucharest)", or a "usage limit: rejected" progress line), the task goes to `waiting_limit` with `resume_at` (read with its time zone; every 30 min if unreadable). At `resume_at` + 2 min the same session is resumed by itself, in the same permission mode, with a configurable message; 20 s between resumes, at most 6 per task, each logged in `auto_resume_history`. Waiting tasks are kept in `tasks.json`, re-armed at start-up and checked every 60 s against the wall clock (so a sleep is caught up). Setting *Reprendre automatiquement après la limite d'usage*, on by default. While a task runs or waits, `caffeinate -i` keeps the Mac awake (setting *Keep the Mac awake while working*, on by default); **with the lid closed on battery macOS sleeps anyway: leave the Mac open or plugged in.** `cc_list` warns when the default mode is `bypassPermissions`.
+
 **Known limits:** beyond 2 h, or with a client that refuses long calls, the chat calls `cc_wait` again; nothing is lost. If a client drops a long call silently, a few progress lines may be skipped, but the status, report, questions and blocked actions always come back. Closing the Claude app still stops a running task (`interrupted`, resumable with `cc_reply`).
 **Permissions:** headless Claude Code can't prompt you, so blocked actions come back as `needs_permission` and the chat asks you. The default is `acceptEdits`; `bypassPermissions` is refused unless you enable it in the settings.
 **Robust:** the brief goes through stdin (no size limit), sessions are pinned with `--session-id` and resumed with `--resume`, tasks survive an app restart, stopping a task kills what it launched, and the permission modes are read from your installed `claude --help`.

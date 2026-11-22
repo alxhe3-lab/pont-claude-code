@@ -1,12 +1,14 @@
 {
   "name": "pont-claude-code",
-  "version": "0.3.0",
-  "description": "Bridge a Claude chat (Claude Desktop) and Claude Code: delegate, follow, answer questions, get results \u2014 no copy-paste.",
+  "version": "0.4.0",
+  "description": "Bridge a Claude chat (Claude Desktop) and Claude Code: delegate, follow, answer questions, get results — no copy-paste.",
   "main": "dist/index.mjs",
   "scripts": {
     "start": "node server/index.js",
-    "test": "node test/e2e.mjs && PONT_SERVER=dist/index.mjs node test/e2e.mjs",
-    "pack": "npm run build && npx -y @anthropic-ai/mcpb pack . pont-claude-code.mcpb",
+    "typecheck": "tsc -p tsconfig.json",
+    "test:unit": "node --test test/unit.mjs",
+    "test": "node --test test/unit.mjs && node test/e2e.mjs && npm run build && PONT_SERVER=dist/index.mjs node test/e2e.mjs",
+    "pack": "npm run build && npx -y @anthropic-ai/mcpb pack . pont-claude-code-$npm_package_version.mcpb",
     "test:real": "node test/real.mjs",
     "build": "esbuild server/index.js --bundle --platform=node --target=node18 --format=esm --minify --legal-comments=none --outfile=dist/index.mjs --banner:js=\"import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\""
   },
@@ -30,7 +32,9 @@
     "node": ">=18"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2"
+    "@types/node": "^24.19.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3"
   },
   "files": [
     "dist",

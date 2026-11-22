@@ -2,12 +2,11 @@
   "manifest_version": "0.3",
   "name": "pont-claude-code",
   "display_name": "Pont Claude Code",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Let your Claude chat hand work to Claude Code on your computer, follow it, answer its questions and get the result back. No more copy-paste.",
-  "long_description": "Pont Claude Code connects a conversation in the Claude desktop app to Claude Code on the same computer.\n\nThe chat writes the brief, starts Claude Code in the project folder, follows its progress, answers Claude Code's questions itself whenever the answer is already in the conversation, and only interrupts you at the end, or when it needs information that only you have.\n\nRequires Claude Code to be installed and signed in on this computer (`claude` command).",
+  "long_description": "Pont Claude Code connects a conversation in the Claude desktop app to Claude Code on the same computer.\n\nThe chat writes the brief, starts Claude Code in the project folder, follows its progress, answers Claude Code's questions itself whenever the answer is already in the conversation, and only interrupts you at the end, or when it needs information that only you have.\n\nIf Claude Code stops on a usage limit, the task waits and resumes by itself after the reset. While work is going on, the Mac is kept awake (caffeinate).\n\nRequires Claude Code to be installed and signed in on this computer (`claude` command).",
   "author": {
-    "name": "alxhe3-lab",
-    "url": "https://github.com/alxhe3-lab"
+    "name": "alxhe3-lab"
   },
   "license": "MIT",
   "keywords": [
@@ -31,7 +30,11 @@
         "PONT_ALLOWED_TOOLS": "${user_config.allowed_tools}",
         "PONT_MODEL": "${user_config.model}",
         "CLAUDE_BIN": "${user_config.claude_bin}",
-        "PONT_ALLOW_BYPASS": "${user_config.allow_bypass}"
+        "PONT_ALLOW_BYPASS": "${user_config.allow_bypass}",
+        "PONT_UNTIL_DONE_SAFETY_S": "${user_config.until_done_safety_seconds}",
+        "PONT_AUTO_RESUME": "${user_config.auto_resume}",
+        "PONT_AUTO_RESUME_MESSAGE": "${user_config.auto_resume_message}",
+        "PONT_KEEP_AWAKE": "${user_config.keep_awake}"
       }
     }
   },
@@ -42,7 +45,7 @@
     },
     {
       "name": "cc_wait",
-      "description": "Follow a task: progress, then the report, questions or blocked actions. until_done waits for the end (up to 2 h)."
+      "description": "Follow a task: progress, then the report, questions or blocked actions. until_done waits for the end (comes back with \"running\" after the safety limit, 70 s by default). A task stopped by a usage limit shows status waiting_limit and resume_at: it resumes by itself."
     },
     {
       "name": "cc_reply",
@@ -50,11 +53,11 @@
     },
     {
       "name": "cc_stop",
-      "description": "Interrupt a task and what it launched (the session is kept)."
+      "description": "Interrupt a task and what it launched, or cancel its automatic resume (the session is kept)."
     },
     {
       "name": "cc_list",
-      "description": "Recent tasks (kept across restarts) and the bridge's setup."
+      "description": "Recent tasks (kept across restarts; tasks waiting for a usage limit show resume_at) and the bridge's setup."
     }
   ],
   "user_config": {
@@ -86,6 +89,36 @@
       "required": false,
       "default": false
     },
+    "until_done_safety_seconds": {
+      "type": "number",
+      "title": "until_done safety limit (seconds)",
+      "description": "A cc_wait / cc_reply with until_done comes back by itself after this many seconds with status \"running\" (the task goes on), before remote sessions cut the call at about 80 s. 0 = no limit (wait up to max_minutes).",
+      "required": false,
+      "default": 70,
+      "min": 0,
+      "max": 7200
+    },
+    "auto_resume": {
+      "type": "boolean",
+      "title": "Reprendre automatiquement après la limite d'usage",
+      "description": "When Claude Code stops on a usage limit (\"You've hit your 5-hour limit · resets 3:10am\"), the task waits (status waiting_limit) and the same session is resumed by itself 2 minutes after the reset, in the same permission mode, at most 6 times per task. If the reset time can't be read, it tries again every 30 minutes.",
+      "required": false,
+      "default": true
+    },
+    "auto_resume_message": {
+      "type": "string",
+      "title": "Automatic resume message",
+      "description": "Message sent to Claude Code when it is resumed after a usage limit.",
+      "required": false,
+      "default": "Ta limite d'usage est levée. Reprends exactement là où tu t'es arrêté, sans refaire ce qui est déjà fait. Les consignes, le feu vert et le compte rendu demandés au départ restent valables. FIN DU MESSAGE"
+    },
+    "keep_awake": {
+      "type": "boolean",
+      "title": "Keep the Mac awake while working",
+      "description": "macOS: runs caffeinate -i while a task runs or waits for its usage limit, and stops it when nothing is left. With the lid closed on battery, macOS sleeps anyway: leave the Mac open or plugged in.",
+      "required": false,
+      "default": true
+    },
     "model": {
       "type": "string",
       "title": "Model (optional)",
@@ -111,9 +144,5 @@
       "node": ">=18.0.0"
     }
   },
-  "icon": "icon.png",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/alxhe3-lab/pont-claude-code"
-  }
+  "icon": "icon.png"
 }

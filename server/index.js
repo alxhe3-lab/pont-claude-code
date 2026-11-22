@@ -7,12 +7,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { spawn, execFile, execFileSync } from "node:child_process";
-import { existsSync, statSync, mkdirSync, readFileSync, writeFileSync, renameSync, realpathSync } from "node:fs";
+import { existsSync, statSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { randomUUID } from "node:crypto";
+import { resolveModeSetting, parseSafetySetting, untilDoneBudget, saveTaskFiles, backupOnce, waitFor, LIVE, DEFAULT_SAFETY_S } from "./lib.js";
+import {
+  WAITING, DEFAULT_RESUME_MESSAGE, MAX_AUTO_RESUMES, RESUME_DELAY_MS, RESUME_SPACING_MS, RESUME_CHECK_MS, LIMIT_RETRY_MS,
+  isUsageLimitEnd, planAfterLimit, formatHM, createResumeScheduler, createKeepAwake,
+} from "./autoresume.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const QUESTION_MARKER = "BRIDGE_QUESTION:";
 const MAX_WAIT_S = 50;          // stay well under the 60 s MCP request timeout of most clients
 const DEFAULT_WAIT_S = 45;
@@ -33,12 +38,25 @@ const log = (...a) => console.error("[pont-claude-code]", ...a);
 const cfg = (name) => { const v = (process.env[name] || "").trim(); return v.startsWith("${") ? "" : v; };
 const expandHome = (p) => (p && (p === "~" || p.startsWith("~/") || p.startsWith("~\\")) ? join(homedir(), p.slice(1)) : p);
 const truthy = (v) => /^(1|true|yes|on)$/i.test(v);
+const onUnlessOff = (v) => !/^(0|false|no|off)$/i.test(v); // settings that are on by default
+const msSetting = (name, def) => { const n = Number(cfg(name)); return cfg(name) && Number.isFinite(n) && n >= 0 ? n : def; };
 
 const DEFAULT_CWD = expandHome(cfg("PONT_DEFAULT_CWD")) || homedir();
 const ALLOWED_TOOLS = cfg("PONT_ALLOWED_TOOLS");   // comma-separated, e.g. "Bash(npm:*),Bash(git:*)"
 const MODEL = cfg("PONT_MODEL");
 const ALLOW_BYPASS = truthy(cfg("PONT_ALLOW_BYPASS"));
 const STATE_DIR = expandHome(cfg("PONT_STATE_DIR")) || join(homedir(), ".pont-claude-code");
+
+// Automatic resume after a usage limit (on by default) and keeping the Mac awake (on by default).
+const AUTO_RESUME = onUnlessOff(cfg("PONT_AUTO_RESUME"));
+const AUTO_RESUME_MESSAGE = cfg("PONT_AUTO_RESUME_MESSAGE") || DEFAULT_RESUME_MESSAGE;
+const KEEP_AWAKE = onUnlessOff(cfg("PONT_KEEP_AWAKE"));
+// Timings: fixed in use; the PONT_*_MS variables only exist so that the tests don't wait for real.
+const RESUME_DELAY = msSetting("PONT_RESUME_DELAY_MS", RESUME_DELAY_MS);
+const RESUME_SPACING = msSetting("PONT_RESUME_SPACING_MS", RESUME_SPACING_MS);
+const RESUME_CHECK = msSetting("PONT_RESUME_CHECK_MS", RESUME_CHECK_MS) || RESUME_CHECK_MS;
+const LIMIT_RETRY = msSetting("PONT_LIMIT_RETRY_MS", LIMIT_RETRY_MS);
+const CAFFEINATE_BIN = cfg("PONT_CAFFEINATE_BIN") || "caffeinate";
 
 // Modes known to Claude Code (2.x). The real list is read from `claude --help` on first use.
 const FALLBACK_MODES = ["acceptEdits", "auto", "manual", "dontAsk", "plan", "bypassPermissions"];
@@ -102,12 +120,11 @@ function getPermissionModes() {
       const m = flat.match(/--permission-mode <mode>.*?\(choices: ([^)]*)\)/);
       const found = m ? [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]) : [];
       permissionModes = found.length ? found : FALLBACK_MODES;
-      // Validate the default mode from the settings once the real list is known.
-      const d = MODE_ALIASES[DEFAULT_MODE] || DEFAULT_MODE;
-      if (!permissionModes.includes(d)) {
-        configWarnings.push(`Default mode "${DEFAULT_MODE}" isn't supported by this Claude Code; using acceptEdits.`);
-        DEFAULT_MODE = "acceptEdits";
-      } else DEFAULT_MODE = d;
+      // Read the default mode from the settings once the real list is known. A mistyped value
+      // that contains exactly one mode name (e.g. "Allow bypassPermissions") uses that mode.
+      const r = resolveModeSetting(MODE_SETTING, permissionModes, { aliases: MODE_ALIASES, allowBypass: ALLOW_BYPASS });
+      DEFAULT_MODE = r.mode;
+      for (const w of r.warnings) { configWarnings.push(w); log("warning:", w); }
       res(permissionModes);
     });
   });
@@ -124,11 +141,15 @@ async function checkMode(mode) {
   return { mode: m };
 }
 
-let DEFAULT_MODE = cfg("PONT_PERMISSION_MODE") || "acceptEdits";
-if (DEFAULT_MODE === "bypassPermissions" && !ALLOW_BYPASS) {
-  configWarnings.push(`Default mode bypassPermissions needs "Allow bypassPermissions"; using acceptEdits.`);
-  DEFAULT_MODE = "acceptEdits";
-}
+const MODE_SETTING = cfg("PONT_PERMISSION_MODE");
+// Safe value until `claude --help` has been read (defaultMode() always waits for that).
+let DEFAULT_MODE = "acceptEdits";
+
+// until_done: return on our own with status "running" after this many seconds (0 = off), so
+// that clients cutting long tool calls (remote sessions: about 80 s) get an answer instead.
+const SAFETY = parseSafetySetting(cfg("PONT_UNTIL_DONE_SAFETY_S"), { def: DEFAULT_SAFETY_S, max: MAX_UNTIL_DONE_MIN * 60 });
+if (SAFETY.warning) configWarnings.push(SAFETY.warning);
+const UNTIL_DONE_SAFETY_S = SAFETY.seconds;
 
 // ---------- system prompt addition for Claude Code ----------
 const BRIDGE_RULES = `# Running under Pont Claude Code
@@ -142,11 +163,14 @@ mkdirSync(STATE_DIR, { recursive: true });
 const RULES_FILE = join(STATE_DIR, "bridge-rules.md");
 writeFileSync(RULES_FILE, BRIDGE_RULES);
 const TASKS_FILE = join(STATE_DIR, "tasks.json");
+const ARCHIVE_FILE = join(STATE_DIR, "tasks-archive.json");          // older tasks, moved out unchanged
+const BACKUP_FILE = join(STATE_DIR, "tasks.before-0.3.1.json");      // made once, before the first write
+// 0.4.0 adds the waiting_limit status: keep tasks.json as 0.3.x left it, once.
+backupOnce(TASKS_FILE, join(STATE_DIR, "tasks.before-0.4.0.json"));
 
 // ---------- task registry (persisted so tasks survive an app restart) ----------
 /** @type {Map<string, any>} */
 const tasks = new Map();
-const LIVE = new Set(["starting", "running"]);
 
 function loadTasks() {
   try {
@@ -164,24 +188,32 @@ function saveTasks() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveNow, 300);
 }
+// tasks.json keeps the MAX_TASKS_SAVED most recent tasks; older ones go to tasks-archive.json.
+const archivedKeys = new Set();
 function saveNow() {
   clearTimeout(saveTimer);
   try {
-    const list = [...tasks.values()].slice(-MAX_TASKS_SAVED).map((t) => {
+    const all = [...tasks.values()];
+    const ordered = [...all.filter((t) => t.status !== WAITING), ...all.filter((t) => t.status === WAITING)];
+    const list = ordered.map((t) => {
       const { proc, waiters, stderr, ...rest } = t;
       return { ...rest, events: t.events.slice(-40) };
     });
-    const tmp = TASKS_FILE + ".tmp";
-    writeFileSync(tmp, JSON.stringify({ version: VERSION, tasks: list }, null, 1));
-    renameSync(tmp, TASKS_FILE);
-  } catch (e) { log("could not save tasks:", e.message); }
+    const r = saveTaskFiles({ file: TASKS_FILE, archiveFile: ARCHIVE_FILE, backupFile: BACKUP_FILE, list, max: MAX_TASKS_SAVED, version: VERSION, archivedKeys });
+    if (r.archived) log(`moved ${r.archived} older task(s) to ${ARCHIVE_FILE}`);
+    if (r.warning) log("warning:", r.warning);
+  } catch (e) { log("could not save tasks:", /** @type {Error} */ (e).message); }
 }
+
+// Most recently active last: a task that runs again counts as recent (kept in tasks.json).
+function touch(t) { tasks.delete(t.id); tasks.set(t.id, t); }
 
 function blankTask() {
   return {
     id: "", title: "", cwd: "", permissionMode: DEFAULT_MODE, sessionId: null, status: "starting",
     events: [], cursor: 0, runs: 0, result: null, questions: [], denials: [], error: null,
     costUsd: 0, turns: 0, startedAt: null, runStartedAt: null, endedAt: null, durationMs: 0,
+    resumeAt: null, autoResumes: 0, autoResumeHistory: [], limitMessage: null,
     proc: null, waiters: new Set(), stderr: "",
   };
 }
@@ -192,7 +224,7 @@ function newTask({ cwd, permissionMode, sessionId, title }) {
   const t = { ...blankTask(), id, title: title || "", cwd, permissionMode, sessionId: sessionId || null, startedAt: new Date().toISOString() };
   tasks.set(id, t);
   while (tasks.size > MAX_TASKS_SAVED * 2) { // forget the oldest finished tasks
-    const old = [...tasks.values()].find((x) => !LIVE.has(x.status));
+    const old = [...tasks.values()].find((x) => !LIVE.has(x.status) && x.status !== WAITING);
     if (!old) break;
     tasks.delete(old.id);
   }
@@ -240,8 +272,9 @@ function runClaude(t, prompt, { resume }) {
   if (ALLOWED_TOOLS) args.push("--allowedTools", ALLOWED_TOOLS);
   if (MODEL) args.push("--model", MODEL);
 
-  Object.assign(t, { status: "running", result: null, questions: [], denials: [], error: null, stderr: "", runStartedAt: Date.now(), endedAt: null });
+  Object.assign(t, { status: "running", result: null, questions: [], denials: [], error: null, stderr: "", runStartedAt: Date.now(), endedAt: null, resumeAt: null, limitMessage: null });
   t.runs += 1;
+  touch(t);
   pushEvent(t, `▶️ run ${t.runs} (${t.permissionMode}) in ${t.cwd}`);
   saveTasks();
 
@@ -252,12 +285,14 @@ function runClaude(t, prompt, { resume }) {
     return finish(t, "error", { error: `Could not start Claude Code (${CLAUDE_BIN}): ${e.message}` });
   }
   t.proc = proc;
+  refreshAwake();
   // The prompt goes through stdin: no command-line length or quoting limits.
   proc.stdin.on("error", () => {});
   proc.stdin.end(prompt);
 
   let buf = "";
   let finalMsg = null;
+  let rejected = false, resetsAt = null; // "usage limit: rejected" seen during this run
   proc.stdout.setEncoding("utf8");
   proc.stdout.on("data", (chunk) => {
     buf += chunk;
@@ -276,6 +311,7 @@ function runClaude(t, prompt, { resume }) {
         }
       } else if (msg.type === "rate_limit_event" && msg.rate_limit_info?.status && msg.rate_limit_info.status !== "allowed") {
         pushEvent(t, `⚠️ usage limit: ${msg.rate_limit_info.status}`);
+        if (msg.rate_limit_info.status === "rejected") { rejected = true; resetsAt = msg.rate_limit_info.resetsAt ?? resetsAt; }
       } else if (msg.type === "result") {
         finalMsg = msg;
       }
@@ -294,6 +330,8 @@ function runClaude(t, prompt, { resume }) {
     if (t.status === "stopped") return finish(t, "stopped");
     if (!finalMsg) {
       const why = t.stderr.trim() || "no output";
+      if (isUsageLimitEnd({ text: t.stderr, isError: true, rejected }))
+        return limitReached(t, { text: t.stderr.trim(), resetsAt, fields: { error: `Claude Code stopped on a usage limit: ${clip(why, 1500)}` } });
       const hint = resume && /no conversation found|session/i.test(why)
         ? " (to resume a session, cwd must be the folder where that session was started)" : "";
       return finish(t, "error", { error: `Claude Code exited (code ${code}${signal ? ", " + signal : ""}) without a result: ${clip(why, 1500)}${hint}` });
@@ -311,6 +349,8 @@ function runClaude(t, prompt, { resume }) {
       input: clip(typeof d.tool_input?.command === "string" ? d.tool_input.command : JSON.stringify(d.tool_input || {}), 300),
     }));
     const extra = { result: text, questions, denials };
+    if (isUsageLimitEnd({ text, isError: !!finalMsg.is_error, rejected }))
+      return limitReached(t, { text, resetsAt, fields: { ...extra, error: clip(text || "usage limit", 2000) } });
     if (finalMsg.is_error) return finish(t, "error", { ...extra, error: clip(text || finalMsg.subtype || "Claude Code reported an error", 2000) });
     finish(t, questions.length ? "needs_input" : denials.length ? "needs_permission" : "done", extra);
   });
@@ -323,30 +363,71 @@ function finish(t, status, fields = {}) {
   pushEvent(t, `⏹ run ${t.runs} ended: ${status}`);
   saveTasks();
   settle(t);
+  refreshAwake();
 }
 
-// Resolves with "settled" (the run ended), "timeout" or "aborted" (the client gave up on the
-// request). Waiting never touches the task itself: an aborted wait just stops listening.
-function waitFor(t, seconds, signal) {
-  if (!LIVE.has(t.status)) return Promise.resolve("settled");
-  if (signal?.aborted) return Promise.resolve("aborted");
-  if (seconds <= 0) return Promise.resolve("timeout");
-  return new Promise((res) => {
-    const check = () => { if (!LIVE.has(t.status)) done("settled"); };
-    const onAbort = () => done("aborted");
-    const timer = setTimeout(() => done("timeout"), seconds * 1000);
-    function done(why) {
-      clearTimeout(timer); t.waiters.delete(check); signal?.removeEventListener("abort", onAbort); res(why);
-    }
-    t.waiters.add(check);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
+// ---------- usage limit: wait, then resume the same session by itself ----------
+// The run ended on a usage limit: the task waits (status waiting_limit) until resume_at, then the
+// scheduler resumes it at resume_at + 2 min, like cc_reply would, in the same permission mode.
+function limitReached(t, { text, resetsAt, fields }) {
+  const now = Date.now();
+  const plan = planAfterLimit({ text, resetsAt, now, autoResumes: t.autoResumes || 0, enabled: AUTO_RESUME, retryMs: LIMIT_RETRY });
+  if (plan.wait === false) {
+    pushEvent(t, `⚠️ usage limit: ${plan.reason}`);
+    log(`task ${t.id}: usage limit, ${plan.reason}`);
+    return finish(t, "error", { ...fields, error: `${fields.error || "usage limit"} (${plan.reason})` });
+  }
+  const resumeAt = new Date(plan.resumeAt).toISOString();
+  const when = plan.how === "retry"
+    ? `reset time unreadable: new try at ${formatHM(plan.resumeAt + RESUME_DELAY)}`
+    : `resets ${formatHM(plan.resumeAt)}, automatic resume at ${formatHM(plan.resumeAt + RESUME_DELAY)}`;
+  pushEvent(t, `⏸ usage limit (${when}; ${t.autoResumes || 0}/${MAX_AUTO_RESUMES} automatic resumes done)`);
+  log(`task ${t.id}: usage limit → ${WAITING}, resume_at ${resumeAt} (${plan.how}), resumes at ${new Date(plan.resumeAt + RESUME_DELAY).toISOString()}`);
+  finish(t, WAITING, { ...fields, resumeAt, limitMessage: clip(String(text || ""), 300) || null });
+  scheduler.poke();
 }
+
+async function autoResume(t) {
+  if (t.status !== WAITING) return;
+  // Same permission mode as the last run, re-checked against today's settings: never a wider one.
+  const m = await checkMode(t.permissionMode);
+  if (t.status !== WAITING) return; // stopped or replied to meanwhile
+  const giveUp = (/** @type {string} */ why) => {
+    log(`task ${t.id}: automatic resume impossible: ${why}`);
+    finish(t, "error", { resumeAt: null, error: `Automatic resume impossible: ${why}` });
+  };
+  if (m.error) return giveUp(m.error);
+  if (!t.sessionId) return giveUp("no Claude Code session to resume");
+  try { resolveDir(t.cwd); } catch (e) { return giveUp(/** @type {Error} */ (e).message); }
+  t.autoResumes = (t.autoResumes || 0) + 1;
+  const line = `reprise automatique n°${t.autoResumes} à ${formatHM(Date.now())}`;
+  t.autoResumeHistory = [...(t.autoResumeHistory || []), line];
+  pushEvent(t, `🔁 ${line}`);
+  log(`task ${t.id}: ${line} (${t.permissionMode})`);
+  runClaude(t, AUTO_RESUME_MESSAGE, { resume: true });
+}
+
+const scheduler = createResumeScheduler({
+  getTasks: () => tasks.values(), launch: autoResume,
+  delayMs: RESUME_DELAY, spacingMs: RESUME_SPACING, checkMs: RESUME_CHECK,
+  onTick: () => refreshAwake(),
+});
+
+// ---------- keep the Mac awake while something runs or waits ----------
+const keepAwake = createKeepAwake({ enabled: KEEP_AWAKE, spawn, bin: CAFFEINATE_BIN, log });
+function refreshAwake() {
+  keepAwake.update([...tasks.values()].some((t) => t.proc || LIVE.has(t.status) || t.status === WAITING));
+}
+
+// waitFor(t, seconds, signal) is in lib.js: "settled", "timeout" or "aborted" (client gave up).
 
 // Long wait (until_done): wait for the end of the run, up to maxMinutes. Sends MCP progress
 // notifications while waiting when the client supplied a progressToken, so clients that reset
 // their timeout on progress keep the call open.
-async function waitUntilDone(t, maxMinutes, extra) {
+// Returns why the wait ended and which limit applied: the safety limit (default 70 s, so the
+// call comes back with "running" before a remote session cuts it at ~80 s) or max_minutes.
+async function waitUntilDone(t, { maxMinutes, safetySeconds }, extra) {
+  const budget = untilDoneBudget({ maxMinutes, safetySeconds });
   const token = extra?._meta?.progressToken;
   let ticker = null, n = 0;
   if (token !== undefined && LIVE.has(t.status)) {
@@ -358,18 +439,31 @@ async function waitUntilDone(t, maxMinutes, extra) {
     ping();
     ticker = setInterval(ping, PROGRESS_EVERY_S * 1000);
   }
-  try { return await waitFor(t, maxMinutes * 60, extra?.signal); }
+  try { return { why: await waitFor(t, budget.seconds, extra?.signal), ...budget, maxMinutes }; }
   finally { clearInterval(ticker); }
 }
 
+/** Options of an until_done call → what waitUntilDone needs. */
+const untilDoneOpts = (/** @type {number | undefined} */ max_minutes, /** @type {number | undefined} */ safety_seconds) =>
+  ({ maxMinutes: max_minutes ?? DEFAULT_UNTIL_DONE_MIN, safetySeconds: safety_seconds ?? UNTIL_DONE_SAFETY_S });
+
 // What the tool returns after a wait. If the client already gave up on the request, don't
 // build a report: the progress cursor stays put, so the next cc_wait gets every line.
-function afterWait(t, why, { untilDone, maxMinutes } = {}) {
+/**
+ * @param {any} t
+ * @param {string | { why: string, seconds: number, limit: string, maxMinutes: number }} w
+ *   "settled"/"timeout"/"aborted", or the result of waitUntilDone
+ */
+function afterWait(t, w) {
+  const long = typeof w === "object" ? w : null;
+  const why = long ? long.why : w;
   if (why === "aborted") return fail("Request cancelled by the client. The Claude Code task keeps running: call cc_wait with this task_id to follow it.");
   const r = report(t);
-  if (untilDone && why === "timeout" && LIVE.has(t.status)) {
+  if (long && why === "timeout" && LIVE.has(t.status)) {
     const o = JSON.parse(r.content[0].text);
-    o.note = `Still running after max_minutes (${maxMinutes}). Nothing was interrupted: call cc_wait again (until_done: true) to keep waiting, or cc_stop it.`;
+    o.note = long.limit === "safety"
+      ? `Still running; returned after the ${long.seconds} s safety limit so that this call isn't cut by the client (remote sessions stop calls at about 80 s). Nothing was interrupted: call cc_wait again (until_done: true) to keep waiting, or cc_stop it.`
+      : `Still running after max_minutes (${long.maxMinutes}). Nothing was interrupted: call cc_wait again (until_done: true) to keep waiting, or cc_stop it.`;
     r.content[0].text = JSON.stringify(o, null, 1);
   }
   return r;
@@ -382,6 +476,7 @@ const NEXT_STEP = {
   done: "Finished. Read the report and check it answers the brief; if not, cc_reply with what's missing. Then tell the user the outcome in a few lines (not the raw log).",
   error: "Failed. Explain the error to the user in plain words; retry with cc_reply (same session) or cc_start if it makes sense.",
   stopped: "Stopped. The session is kept: cc_reply continues it.",
+  [WAITING]: "Claude Code hit its usage limit. The bridge resumes this same session by itself at resume_at + 2 min, in the same permission mode, with a message asking it to pick up exactly where it stopped: nothing to do. Tell the user in one line when it will resume; don't poll (cc_wait later if you want the outcome). cc_reply resumes it now instead (it may hit the limit again); cc_stop cancels the automatic resume.",
   interrupted: "The Claude app closed while this task was running. cc_reply (e.g. 'continue where you stopped') resumes the same session.",
 };
 
@@ -408,6 +503,12 @@ function report(t) {
     earlier_progress_lines_skipped: kept.length > shown.length ? kept.length - shown.length : undefined,
     next_step: NEXT_STEP[t.status] || "",
   };
+  if (t.status === WAITING) {
+    out.resume_at = t.resumeAt;
+    out.resumes_at_local = t.resumeAt ? formatHM(Date.parse(t.resumeAt) + RESUME_DELAY) : undefined;
+  }
+  if (t.autoResumes || t.status === WAITING) out.auto_resumes = `${t.autoResumes || 0}/${MAX_AUTO_RESUMES}`;
+  if (t.autoResumeHistory?.length) out.auto_resume_history = t.autoResumeHistory;
   if (!live) {
     if (t.result) out.report = clip(t.result, MAX_RESULT_CHARS);
     if (t.questions?.length) out.questions = t.questions;
@@ -415,10 +516,10 @@ function report(t) {
     if (t.error) out.error = t.error;
     if (t.status === "done" && /\?\s*$/.test(t.result || "")) out.note = "The report ends with a question: Claude Code may be waiting for an answer.";
   }
-  return { content: [{ type: "text", text: JSON.stringify(out, null, 1) }] };
+  return { content: [{ type: /** @type {const} */ ("text"), text: JSON.stringify(out, null, 1) }] };
 }
 
-const fail = (msg) => ({ isError: true, content: [{ type: "text", text: msg }] });
+const fail = (/** @type {string} */ msg) => ({ isError: true, content: [{ type: /** @type {const} */ ("text"), text: msg }] });
 
 function getTask(id) {
   const t = tasks.get(String(id).trim());
@@ -443,10 +544,11 @@ const server = new McpServer(
     instructions: `Pont Claude Code lets you hand work to Claude Code on the user's computer and get the result back, so the user never copy-pastes between this chat and Claude Code.
 How to work:
 1. cc_start with a COMPLETE brief. Claude Code cannot see this conversation: include the goal, decisions already made, constraints, relevant facts the user gave you, and what "done" looks like. Pass the project folder as cwd.
-2. While status is "running", call cc_wait with until_done: true: the call stays open until the task finishes, asks a question or is blocked (or max_minutes, default ${DEFAULT_UNTIL_DONE_MIN}, max ${MAX_UNTIL_DONE_MIN}), so you don't have to poll. If such a call ends in a timeout error, nothing is lost: the task keeps running and the next cc_wait picks it up; then fall back to plain cc_wait calls (${MAX_WAIT_S} s max each). Don't narrate each check to the user.
+2. While status is "running", call cc_wait with until_done: true: the call stays open until the task finishes, asks a question or is blocked (or max_minutes, default ${DEFAULT_UNTIL_DONE_MIN}, max ${MAX_UNTIL_DONE_MIN}), so you don't have to poll.${UNTIL_DONE_SAFETY_S ? ` For safety it comes back by itself after ${UNTIL_DONE_SAFETY_S} s with status "running" (remote sessions cut calls at about 80 s): just call cc_wait with until_done: true again.` : ""} If such a call ends in a timeout error, nothing is lost: the task keeps running and the next cc_wait picks it up; then fall back to plain cc_wait calls (${MAX_WAIT_S} s max each). Don't narrate each check to the user.
 3. "needs_input": answer Claude Code's questions yourself with cc_reply whenever the answer is in this conversation or is a sensible default. Interrupt the user only for information or decisions only they have.
 4. "needs_permission": tell the user what was blocked and ask; then cc_reply with the permission_mode they accept.
-5. "done": check the report against the brief (cc_reply for anything missing), then give the user a short summary, and only then ask any open questions.
+5. "waiting_limit": Claude Code hit its usage limit; the bridge resumes the same session by itself after the reset (resume_at + 2 min). Tell the user when, and don't poll.
+6. "done": check the report against the brief (cc_reply for anything missing), then give the user a short summary, and only then ask any open questions.
 For follow-up work on the same project, prefer cc_reply on the same task: Claude Code keeps its context.`,
   }
 );
@@ -485,26 +587,25 @@ server.registerTool("cc_start", {
   return r;
 });
 
-const untilDoneSchema = z.boolean().optional().describe(`Wait until the run ends (done, needs_input, needs_permission, error, stopped, interrupted) instead of at most ${MAX_WAIT_S} s, up to max_minutes. Use it for any task that may take more than a minute: the call stays open and returns once there is something to act on, so there is no need to poll. If the call ends in a timeout error, the task keeps running; call cc_wait again.`);
+const untilDoneSchema = z.boolean().optional().describe(`Wait until the run ends (done, needs_input, needs_permission, error, stopped, interrupted) instead of at most ${MAX_WAIT_S} s, up to max_minutes, or until the safety limit (safety_seconds, ${UNTIL_DONE_SAFETY_S ? UNTIL_DONE_SAFETY_S + " s here" : "off here"}). Use it for any task that may take more than a minute: the call stays open and returns once there is something to act on. If it comes back with status "running", or ends in a timeout error, the task keeps running; call cc_wait again.`);
 const maxMinutesSchema = z.number().positive().max(MAX_UNTIL_DONE_MIN).optional().describe(`With until_done: longest wait in minutes (default ${DEFAULT_UNTIL_DONE_MIN}, max ${MAX_UNTIL_DONE_MIN}). If reached, the task keeps running and the usual report comes back with status "running".`);
+const safetySchema = z.number().min(0).max(MAX_UNTIL_DONE_MIN * 60).optional().describe(`With until_done: return on its own with status "running" after this many seconds, before a client that cuts long calls (remote sessions: about 80 s) drops it. Default ${UNTIL_DONE_SAFETY_S} (extension setting; ${DEFAULT_SAFETY_S} unless changed). 0 = no safety limit, wait up to max_minutes.`);
 
 server.registerTool("cc_wait", {
   title: "Follow a Claude Code task",
-  description: `Wait until the task stops running (or seconds elapse) and return its status, new progress lines and, when finished, its report, questions or blocked actions. Without until_done it returns within ${MAX_WAIT_S} s. With until_done: true it waits for the end of the run (up to max_minutes, default ${DEFAULT_UNTIL_DONE_MIN}): prefer this for long tasks instead of calling every ${MAX_WAIT_S} s. Waiting never interrupts the task.`,
+  description: `Wait until the task stops running (or seconds elapse) and return its status, new progress lines and, when finished, its report, questions or blocked actions. Without until_done it returns within ${MAX_WAIT_S} s. With until_done: true it waits for the end of the run (up to max_minutes, default ${DEFAULT_UNTIL_DONE_MIN}${UNTIL_DONE_SAFETY_S ? `; it comes back by itself with "running" after the ${UNTIL_DONE_SAFETY_S} s safety limit` : ""}): prefer this for long tasks instead of calling every ${MAX_WAIT_S} s. Waiting never interrupts the task.`,
   inputSchema: {
     task_id: z.string(),
     seconds: z.number().min(0).max(MAX_WAIT_S).optional().describe(`Default ${DEFAULT_WAIT_S}, max ${MAX_WAIT_S}. Ignored when until_done is true.`),
     until_done: untilDoneSchema,
     max_minutes: maxMinutesSchema,
+    safety_seconds: safetySchema,
   },
   annotations: { title: "Follow a Claude Code task", readOnlyHint: true, openWorldHint: false },
-}, async ({ task_id, seconds, until_done, max_minutes }, extra) => {
+}, async ({ task_id, seconds, until_done, max_minutes, safety_seconds }, extra) => {
   try {
     const t = getTask(task_id);
-    if (until_done) {
-      const maxMinutes = max_minutes ?? DEFAULT_UNTIL_DONE_MIN;
-      return afterWait(t, await waitUntilDone(t, maxMinutes, extra), { untilDone: true, maxMinutes });
-    }
+    if (until_done) return afterWait(t, await waitUntilDone(t, untilDoneOpts(max_minutes, safety_seconds), extra));
     return afterWait(t, await waitFor(t, seconds ?? DEFAULT_WAIT_S, extra?.signal));
   } catch (e) { return fail(e.message); }
 });
@@ -519,9 +620,10 @@ server.registerTool("cc_reply", {
     wait_seconds: z.number().min(0).max(MAX_WAIT_S).optional().describe("Default 30. Ignored when until_done is true."),
     until_done: untilDoneSchema,
     max_minutes: maxMinutesSchema,
+    safety_seconds: safetySchema,
   },
   annotations: { title: "Reply to a Claude Code task", readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-}, async ({ task_id, message, permission_mode, wait_seconds, until_done, max_minutes }, extra) => {
+}, async ({ task_id, message, permission_mode, wait_seconds, until_done, max_minutes, safety_seconds }, extra) => {
   try {
     const t = getTask(task_id);
     if (LIVE.has(t.status)) return fail("This task is still running. Call cc_wait first, or cc_stop it.");
@@ -533,23 +635,25 @@ server.registerTool("cc_reply", {
     }
     try { resolveDir(t.cwd); } catch (e) { return fail(e.message); }
     runClaude(t, message, { resume: true });
-    if (until_done) {
-      const maxMinutes = max_minutes ?? DEFAULT_UNTIL_DONE_MIN;
-      return afterWait(t, await waitUntilDone(t, maxMinutes, extra), { untilDone: true, maxMinutes });
-    }
+    if (until_done) return afterWait(t, await waitUntilDone(t, untilDoneOpts(max_minutes, safety_seconds), extra));
     return afterWait(t, await waitFor(t, wait_seconds ?? 30, extra?.signal));
   } catch (e) { return fail(e.message); }
 });
 
 server.registerTool("cc_stop", {
   title: "Stop a Claude Code task",
-  description: "Interrupt a running task, including commands it launched. The session is kept and cc_reply can continue it.",
+  description: "Interrupt a running task, including commands it launched, or cancel the automatic resume of a task waiting for its usage limit. The session is kept and cc_reply can continue it.",
   inputSchema: { task_id: z.string() },
   annotations: { title: "Stop a Claude Code task", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 }, async ({ task_id }) => {
   try {
     const t = getTask(task_id);
-    if (t.proc) {
+    if (t.status === WAITING) {
+      pushEvent(t, "⏹ automatic resume cancelled (cc_stop)");
+      log(`task ${t.id}: automatic resume cancelled`);
+      finish(t, "stopped", { resumeAt: null });
+      scheduler.poke();
+    } else if (t.proc) {
       t.status = "stopped";
       killTree(t.proc);
       await new Promise((r) => { const p = t.proc; if (!p) return r(); p.once("close", r); setTimeout(r, 6000).unref(); });
@@ -560,35 +664,52 @@ server.registerTool("cc_stop", {
 
 server.registerTool("cc_list", {
   title: "List Claude Code tasks",
-  description: "List recent tasks (kept across app restarts) and the bridge's setup: where Claude Code was found, default folder and permission mode.",
+  description: "List recent tasks (kept across app restarts; tasks waiting for a usage limit show resume_at) and the bridge's setup: where Claude Code was found, default folder and permission mode, automatic resume, keep-awake.",
   inputSchema: {},
   annotations: { title: "List Claude Code tasks", readOnlyHint: true, openWorldHint: false },
 }, async () => {
   const list = [...tasks.values()].slice(-20).reverse().map((t) => ({
     task_id: t.id, title: t.title || undefined, status: t.status, cwd: t.cwd, session_id: t.sessionId,
     runs: t.runs, started_at: t.startedAt, ended_at: t.endedAt || undefined,
+    resume_at: t.status === WAITING ? t.resumeAt : undefined,
+    resumes_at_local: t.status === WAITING && t.resumeAt ? formatHM(Date.parse(t.resumeAt) + RESUME_DELAY) : undefined,
+    auto_resumes: t.autoResumes || t.status === WAITING ? `${t.autoResumes || 0}/${MAX_AUTO_RESUMES}` : undefined,
   }));
+  const modes = await getPermissionModes();
+  const warnings = [...configWarnings];
+  if (DEFAULT_MODE === "bypassPermissions") warnings.unshift("mode par défaut dangereux, préférez acceptEdits");
   const setup = {
     version: VERSION, claude: CLAUDE_BIN, default_cwd: DEFAULT_CWD,
-    permission_modes: await getPermissionModes(), default_permission_mode: DEFAULT_MODE, bypass_allowed: ALLOW_BYPASS,
+    permission_modes: modes, default_permission_mode: DEFAULT_MODE, bypass_allowed: ALLOW_BYPASS,
+    until_done_safety_s: UNTIL_DONE_SAFETY_S,
+    auto_resume: { enabled: AUTO_RESUME, max_per_task: MAX_AUTO_RESUMES, delay_after_reset_s: RESUME_DELAY / 1000, spacing_s: RESUME_SPACING / 1000, waiting: [...tasks.values()].filter((t) => t.status === WAITING).length },
+    keep_awake: keepAwake.status,
     allowed_tools: ALLOWED_TOOLS || undefined, model: MODEL || undefined,
-    warnings: configWarnings.length ? configWarnings : undefined,
+    warnings: warnings.length ? warnings : undefined,
   };
   return { content: [{ type: "text", text: JSON.stringify({ setup, tasks: list }, null, 1) }] };
 });
 
 // ---------- lifecycle ----------
 loadTasks();
+scheduler.start(); // re-arms waiting tasks; those already due resume right away (20 s apart)
+refreshAwake();
 const transport = new StdioServerTransport();
 await server.connect(transport);
-log(`v${VERSION} ready — claude: ${CLAUDE_BIN}, default cwd: ${DEFAULT_CWD}, mode: ${DEFAULT_MODE}`);
+log(`v${VERSION} ready — claude: ${CLAUDE_BIN}, default cwd: ${DEFAULT_CWD}, mode setting: ${MODE_SETTING || "(empty)"}, until_done safety: ${UNTIL_DONE_SAFETY_S} s, auto-resume: ${AUTO_RESUME ? "on" : "off"}, keep awake: ${KEEP_AWAKE ? "on" : "off"}`);
+for (const t of tasks.values()) if (t.status === WAITING) log(`task ${t.id}: ${WAITING}, resume_at ${t.resumeAt} (re-armed)`);
 for (const w of configWarnings) log("warning:", w);
-getPermissionModes().then((m) => log("permission modes:", m.join(", "), "— default:", DEFAULT_MODE));
+getPermissionModes().then((m) => {
+  log("permission modes:", m.join(", "), "— default:", DEFAULT_MODE);
+  if (DEFAULT_MODE === "bypassPermissions") log("warning: mode par défaut dangereux, préférez acceptEdits");
+});
 
 let shuttingDown = false;
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  scheduler.stop();   // waiting tasks stay waiting_limit in tasks.json and are re-armed at the next start
+  keepAwake.stop();
   for (const t of tasks.values()) if (t.proc) { killTree(t.proc); t.status = "interrupted"; pushEvent(t, "⚠️ interrupted: the Claude app closed"); }
   saveNow();
   setTimeout(() => process.exit(0), 200).unref();
